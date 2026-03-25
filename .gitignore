@@ -21,8 +21,9 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Claude Code
-.claude/
+# Claude Code (keep skills, ignore the rest)
+.claude/*
+!.claude/skills/
 
 # Logs
 *.log
