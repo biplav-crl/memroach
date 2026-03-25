@@ -595,42 +595,87 @@ def _log(msg: str):
 
 
 def handle_hook():
-    """Handle Claude Code hook events from stdin."""
+    """Handle Claude Code hook events from stdin.
+
+    Called globally for all Claude Code sessions. Must NEVER crash or block —
+    any unhandled exception would disrupt the user's session.
+    """
     try:
         raw = sys.stdin.read()
         if not raw:
             return
 
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return  # Not JSON, not a hook event
+
         event = data.get("hook_event_name", "")
 
         if event not in ("Stop", "SessionEnd"):
             return
 
+        # Check if config exists before attempting push
+        if not CONFIG_FILE.exists():
+            _log("Hook skipped: memroach_config.json not found")
+            return
+
+        # Validate config is loadable
+        try:
+            with open(CONFIG_FILE) as f:
+                config = json.load(f)
+            if not config.get("db_host"):
+                _log("Hook skipped: db_host not configured")
+                return
+        except (json.JSONDecodeError, OSError) as e:
+            _log(f"Hook skipped: config error: {e}")
+            return
+
+        # Check auto-push settings
+        if event == "Stop" and not config.get("auto_push_on_stop", True):
+            return
+        if event == "SessionEnd" and not config.get("auto_push_on_session_end", True):
+            return
+
         _log(f"Hook triggered: {event}")
 
-        # Fork to background so we don't block the hook timeout
-        subprocess.Popen(
-            [sys.executable, __file__, "push", "--quiet"],
-            stdin=subprocess.DEVNULL,
-            stdout=open(LOG_FILE, "a"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        # Fork to background so we don't block the hook timeout.
+        # The subprocess runs independently — even if it fails, the hook returns cleanly.
+        try:
+            log_fh = open(LOG_FILE, "a")
+        except OSError:
+            log_fh = subprocess.DEVNULL
+
+        try:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "push", "--quiet"],
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                cwd=str(SCRIPT_DIR),  # Ensure we're in the right directory
+            )
+        except OSError as e:
+            _log(f"Hook: failed to spawn push subprocess: {e}")
+
     except Exception as e:
-        _log(f"Hook error: {e}")
+        # Absolute last-resort catch — log and return, never crash
+        try:
+            _log(f"Hook error (caught): {e}")
+        except Exception:
+            pass  # Even logging failed, just exit cleanly
 
 
 def main():
-    # Check if running as a hook (stdin has JSON with hook_event_name)
+    # Check if running as a hook (stdin has JSON with hook_event_name).
+    # Wrapped in try/except so hook detection itself never crashes.
     if not sys.stdin.isatty():
-        # Peek at stdin to detect hook mode
         try:
             raw = sys.stdin.buffer.peek(1)
             if raw and raw[0:1] == b"{":
                 handle_hook()
                 return
-        except AttributeError:
+        except (AttributeError, OSError):
             pass
 
     parser = argparse.ArgumentParser(

@@ -112,6 +112,77 @@ Files are auto-classified by path:
 | `session` | UUID directories with `.jsonl` files |
 | `file` | Everything else |
 
+## Auto-Sync via Claude Code Hooks
+
+MemRoach can automatically push changes after every Claude Code session using global hooks. This works across **all projects** — not just the one where MemRoach is installed.
+
+### Setup (global, all projects)
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/memroach/venv/bin/python /absolute/path/to/memroach/memroach_sync.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/absolute/path/to/memroach/venv/bin/python /absolute/path/to/memroach/memroach_sync.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Replace `/absolute/path/to/memroach/` with the actual install location.
+
+### How it works
+
+1. Claude Code fires the `Stop` hook after each response and `SessionEnd` when the session closes
+2. `memroach_sync.py` detects it's running as a hook (JSON on stdin)
+3. It immediately forks a background process and returns (never blocks the 10s timeout)
+4. The background process runs `push --quiet`, logging to `/tmp/memroach_sync.log`
+
+### Safety guarantees
+
+The hook handler is designed to **never crash or block**, even if:
+- `memroach_config.json` doesn't exist (logs "skipped", exits cleanly)
+- DB is unreachable (background process fails silently, logged)
+- Config is invalid JSON (exits cleanly)
+- Any unexpected error occurs (caught at outermost level)
+
+### Disable auto-sync
+
+Set in `memroach_config.json`:
+
+```json
+{
+  "auto_push_on_stop": false,
+  "auto_push_on_session_end": false
+}
+```
+
+Or remove the hooks from `~/.claude/settings.json`.
+
+### Project-level hooks
+
+If you only want auto-sync for a specific project, add the same hooks to `<project>/.claude/settings.json` instead. You can use `$CLAUDE_PROJECT_DIR` in the command if memroach is installed within that project.
+
 ## User Management
 
 MemRoach supports CockroachDB's LDAP/OIDC integration for automatic user provisioning. For environments without an IdP, use `memroach_admin.py` for manual user management.
