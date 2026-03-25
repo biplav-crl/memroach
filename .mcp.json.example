@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "memroach": {
+      "command": "./venv/bin/python",
+      "args": ["memroach_mcp_server.py"],
+      "cwd": "/path/to/memroach"
+    }
+  }
+}

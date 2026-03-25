@@ -1,0 +1,16 @@
+{
+  "db_host": "your-cockroachdb-host.example.com",
+  "db_port": 26257,
+  "db_user": "your_username",
+  "db_password": "your_password",
+  "db_name": "memroach",
+  "db_sslmode": "verify-full",
+  "db_sslrootcert": "/path/to/ca.crt",
+  "machine_id": "",
+  "auto_push_on_stop": true,
+  "auto_push_on_session_end": true,
+  "embed_model": "voyage-3",
+  "embed_api_key": "",
+  "exclude_patterns": [],
+  "max_file_size_mb": 50
+}
