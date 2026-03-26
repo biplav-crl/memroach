@@ -386,6 +386,17 @@ def cmd_push(config: dict, force: bool = False, dry_run: bool = False, verbose: 
                     mtime=f["mtime_iso"],
                 )
 
+        # Record version in history
+        op = "create" if f["remote_version"] == 0 else "update"
+        new_version = f["remote_version"] + 1 if f["remote_version"] > 0 else 1
+        conn.run(
+            "INSERT INTO memroach_history "
+            "(user_name, machine_id, file_path, content_hash, file_size, version, operation) "
+            "VALUES (:user, :machine, :path, :hash, :size, :ver, :op)",
+            user=user, machine=machine_id, path=f["path"],
+            hash=f["hash"], size=f["size"], ver=new_version, op=op,
+        )
+
         pushed += 1
         total_bytes += f["size"]
         if verbose:
@@ -788,6 +799,34 @@ def cmd_search(config: dict, query: str, limit: int = 10):
     conn.close()
 
 
+def cmd_history(config: dict, file_path: str, limit: int = 20):
+    """Show version history for a file."""
+    user = config["db_user"]
+    conn = get_connection(config)
+
+    rows = conn.run(
+        "SELECT h.version, h.operation, h.content_hash, h.file_size, "
+        "h.machine_id, h.created_at "
+        "FROM memroach_history h "
+        "WHERE h.user_name = :user AND h.file_path = :path "
+        "ORDER BY h.created_at DESC LIMIT :lim",
+        user=user, path=file_path, lim=limit,
+    )
+
+    if not rows:
+        print(f"No history for: {file_path}")
+        conn.close()
+        return
+
+    print(f"History for {file_path} ({len(rows)} versions):\n")
+    for row in rows:
+        version, op, content_hash, file_size, machine_id, created_at = row
+        ts = created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at)
+        print(f"  v{version} [{op}] {ts[:19]}  {_human_size(file_size)}  {content_hash[:12]}  ({machine_id})")
+
+    conn.close()
+
+
 def _update_state_cache(files: list[dict]):
     """Update the local state cache with current file info."""
     state = {f["path"]: {"hash": f["hash"], "mtime": f["mtime"], "size": f["size"]} for f in files}
@@ -964,6 +1003,11 @@ def main():
     p_share.add_argument("--team", action="store_const", const="team", dest="visibility", default="team")
     p_share.add_argument("--private", action="store_const", const="private", dest="visibility")
 
+    # history
+    p_history = sub.add_parser("history", help="Show version history for a file")
+    p_history.add_argument("path", help="File path (relative to ~/.claude/)")
+    p_history.add_argument("--limit", type=int, default=20)
+
     # diff
     sub.add_parser("diff", help="Show detailed differences (alias for status -v)")
 
@@ -989,6 +1033,8 @@ def main():
         cmd_status(config, verbose=True)
     elif args.command == "search":
         cmd_search(config, args.query, args.limit)
+    elif args.command == "history":
+        cmd_history(config, args.path, args.limit)
     elif args.command == "share":
         cmd_share(config, args.path, args.visibility)
 

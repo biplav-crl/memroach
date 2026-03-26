@@ -45,6 +45,21 @@ CREATE TABLE IF NOT EXISTS memroach_embeddings (
     UNIQUE (user_name, file_path, content_hash, chunk_index)
 );
 
+-- Version history for file changelog/timeline
+CREATE TABLE IF NOT EXISTS memroach_history (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_name STRING NOT NULL,
+    machine_id STRING NOT NULL,
+    file_path STRING NOT NULL,
+    content_hash STRING(64) NOT NULL REFERENCES memroach_blobs(content_hash),
+    file_size INT8 NOT NULL,
+    version INT8 NOT NULL,
+    operation STRING NOT NULL DEFAULT 'update',  -- 'create', 'update', 'delete'
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_memroach_history_user_path ON memroach_history (user_name, file_path, created_at DESC);
+
 -- Audit log
 CREATE TABLE IF NOT EXISTS memroach_log (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
