@@ -390,6 +390,11 @@ python memroach_web.py --port 9090  # Custom port
 
 Or use the Claude Code shortcut: `/memroach_web`
 
+To make the shortcut available from any project (global scope):
+```bash
+cp /path/to/memroach/.claude/skills/memroach_web.md ~/.claude/skills/
+```
+
 ### Dashboard
 
 Overview of your memory system — file counts by type, total storage, recent activity, and quick stats.
@@ -485,7 +490,8 @@ memroach/
 │   └── memroach_schema.sql    # CockroachDB DDL (7 tables)
 ├── docs/screenshots/          # Web UI screenshots
 ├── requirements.txt           # Python dependencies
-├── .claude/skills/setup.md    # Interactive setup wizard
+├── .claude/skills/setup.md        # Interactive setup wizard
+├── .claude/skills/memroach_web.md # /memroach_web shortcut — launch web UI
 └── README.md
 ```
 
