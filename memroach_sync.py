@@ -23,6 +23,13 @@ from typing import Optional
 
 import pg8000.native
 
+# Optional: embedding support (graceful if not configured)
+try:
+    from memroach_embed import embed_and_store, embed_texts, hybrid_search, get_provider
+    HAS_EMBED = True
+except ImportError:
+    HAS_EMBED = False
+
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "memroach_config.json"
 CLAUDE_DIR = Path.home() / ".claude"
@@ -327,6 +334,24 @@ def cmd_push(config: dict, force: bool = False, dry_run: bool = False, verbose: 
         if verbose:
             print(f"  pushed: {f['path']} ({f['type']})")
 
+    # Generate embeddings for memory/skill files (if configured)
+    embedded = 0
+    if HAS_EMBED and config.get("embed_api_key"):
+        embeddable = [f for f in to_push if f["type"] in ("memory", "skill") and f["size"] < 100000]
+        if embeddable:
+            if verbose:
+                print(f"  Embedding {len(embeddable)} memory/skill files...")
+            for f in embeddable:
+                try:
+                    with open(f["abs_path"], "r", errors="replace") as fh:
+                        content = fh.read()
+                    count = embed_and_store(conn, user, f["path"], content, f["hash"], config)
+                    if count and count > 0:
+                        embedded += count
+                except Exception as e:
+                    if verbose:
+                        print(f"  embed warning: {f['path']}: {e}")
+
     # Log the operation
     conn.run(
         "INSERT INTO memroach_log (user_name, machine_id, operation, files_changed, bytes_transferred) "
@@ -341,6 +366,8 @@ def cmd_push(config: dict, force: bool = False, dry_run: bool = False, verbose: 
     _update_state_cache(local_files)
 
     print(f"Pushed {pushed} files ({_human_size(total_bytes)})")
+    if embedded:
+        print(f"  Embedded {embedded} chunks for semantic search")
     if conflicts:
         print(f"  {conflicts} conflicts (use --force to overwrite)")
 
@@ -541,28 +568,42 @@ def cmd_share(config: dict, file_path: str, visibility: str = "team"):
 
 
 def cmd_search(config: dict, query: str, limit: int = 10):
-    """Search memories using keyword matching (vector search added later)."""
+    """Search memories using hybrid vector + keyword search."""
     user = config["db_user"]
     conn = get_connection(config)
 
-    # For now, keyword search against file paths and content
-    # Vector search will be added in the embeddings phase
+    # Try hybrid search if embeddings are available
+    if HAS_EMBED and config.get("embed_api_key"):
+        try:
+            query_embedding = embed_texts([query], config)[0]
+            results = hybrid_search(conn, user, query_embedding, query, limit)
+            if results:
+                print(f"Results for '{query}' (hybrid search):")
+                for r in results:
+                    vis_tag = " [team]" if r["visibility"] == "team" else ""
+                    snippet = f" — {r['snippet'][:80]}..." if r.get("snippet") else ""
+                    print(f"  [{r['score']:.2f}] {r['path']} ({r['type']}, {_human_size(r['size'])}){vis_tag}{snippet}")
+                conn.close()
+                return
+        except Exception as e:
+            print(f"  (vector search unavailable: {e}, falling back to keyword)")
+
+    # Fallback: keyword search
     results = conn.run(
         "SELECT f.file_path, f.file_type, f.file_size, f.visibility "
         "FROM memroach_files f "
         "WHERE f.user_name = :user AND f.is_deleted = false "
-        "AND (f.file_path ILIKE :pattern OR f.file_type = :query_lower) "
+        "AND f.file_path ILIKE :pattern "
         "ORDER BY f.synced_at DESC LIMIT :lim",
         user=user,
         pattern=f"%{query}%",
-        query_lower=query.lower(),
         lim=limit,
     )
 
     if not results:
         print(f"No results for '{query}'")
     else:
-        print(f"Results for '{query}':")
+        print(f"Results for '{query}' (keyword search):")
         for path, ftype, size, vis in results:
             vis_tag = " [team]" if vis == "team" else ""
             print(f"  {path} ({ftype}, {_human_size(size)}){vis_tag}")

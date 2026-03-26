@@ -19,6 +19,12 @@ from typing import Any, Optional
 import pg8000.native
 from mcp.server.fastmcp import FastMCP
 
+try:
+    from memroach_embed import embed_texts, hybrid_search, embed_and_store, get_provider
+    HAS_EMBED = True
+except ImportError:
+    HAS_EMBED = False
+
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "memroach_config.json"
 
@@ -94,10 +100,10 @@ def _human_size(size: int) -> str:
 
 @mcp.tool()
 def memroach_search(query: str, limit: int = 10) -> dict[str, Any]:
-    """Search memories, skills, and configs using keyword matching.
+    """Search memories, skills, and configs using hybrid vector + keyword search.
 
-    Searches file paths and content for the given query.
-    Returns ranked results with file paths, types, and snippets.
+    Uses semantic vector similarity combined with keyword matching for best results.
+    Falls back to keyword-only if embeddings are not configured.
 
     Args:
         query: Search query string
@@ -105,8 +111,24 @@ def memroach_search(query: str, limit: int = 10) -> dict[str, Any]:
     """
     conn = _get_conn()
     user = _get_user()
+    config = _load_config()
 
-    # Keyword search on file paths
+    # Try hybrid search if embeddings are available
+    if HAS_EMBED and config.get("embed_api_key"):
+        try:
+            query_embedding = embed_texts([query], config)[0]
+            results = hybrid_search(conn, user, query_embedding, query, limit)
+            if results:
+                return {
+                    "query": query,
+                    "search_type": "hybrid",
+                    "count": len(results),
+                    "results": results,
+                }
+        except Exception:
+            pass  # Fall through to keyword search
+
+    # Fallback: keyword search on file paths
     results = conn.run(
         "SELECT f.file_path, f.file_type, f.file_size, f.visibility, f.synced_at "
         "FROM memroach_files f "
@@ -118,40 +140,23 @@ def memroach_search(query: str, limit: int = 10) -> dict[str, Any]:
         lim=limit,
     )
 
-    # Also search in blob content for memory/skill files
-    content_results = conn.run(
-        "SELECT f.file_path, f.file_type, f.file_size, f.visibility, f.synced_at "
-        "FROM memroach_files f "
-        "JOIN memroach_blobs b ON f.content_hash = b.content_hash "
-        "WHERE f.user_name = :user AND f.is_deleted = false "
-        "AND f.file_type IN ('memory', 'skill') "
-        "AND f.file_path NOT ILIKE :pattern "
-        "ORDER BY f.synced_at DESC LIMIT :lim",
-        user=user,
-        pattern=f"%{query}%",
-        lim=limit,
-    )
-
-    # Combine and deduplicate
-    seen = set()
     matches = []
-    for row in list(results) + list(content_results):
-        path = row[0]
-        if path in seen:
-            continue
-        seen.add(path)
+    for row in results:
         matches.append({
-            "path": path,
+            "path": row[0],
             "type": row[1],
             "size": row[2],
             "visibility": row[3],
+            "score": 1.0,
+            "snippet": "",
             "synced_at": row[4].isoformat() if hasattr(row[4], 'isoformat') else str(row[4]),
         })
 
     return {
         "query": query,
+        "search_type": "keyword",
         "count": len(matches),
-        "results": matches[:limit],
+        "results": matches,
     }
 
 
@@ -340,13 +345,34 @@ def memroach_team(query: str, limit: int = 10) -> dict[str, Any]:
     """Search team-shared memories and skills from all team members.
 
     Only returns entries with visibility='team'.
+    Uses hybrid vector + keyword search when embeddings are configured.
 
     Args:
         query: Search query string
         limit: Maximum number of results (default 10)
     """
     conn = _get_conn()
+    user = _get_user()
+    config = _load_config()
 
+    # Try hybrid search if embeddings are available
+    if HAS_EMBED and config.get("embed_api_key"):
+        try:
+            query_embedding = embed_texts([query], config)[0]
+            results = hybrid_search(conn, user, query_embedding, query, limit,
+                                    visibility="team")
+            if results:
+                # Add owner field from user_name for team results
+                return {
+                    "query": query,
+                    "search_type": "hybrid",
+                    "count": len(results),
+                    "results": results,
+                }
+        except Exception:
+            pass  # Fall through to keyword search
+
+    # Fallback: keyword search
     results = conn.run(
         "SELECT f.file_path, f.file_type, f.file_size, f.user_name, f.synced_at "
         "FROM memroach_files f "
@@ -369,6 +395,7 @@ def memroach_team(query: str, limit: int = 10) -> dict[str, Any]:
 
     return {
         "query": query,
+        "search_type": "keyword",
         "count": len(matches),
         "results": matches,
     }
