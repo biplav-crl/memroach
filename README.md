@@ -379,6 +379,95 @@ MemRoach is designed to work transparently with Claude's existing memory system:
 
 See `CLAUDE.md` for the full decision guide.
 
+## Web UI
+
+MemRoach includes a built-in web dashboard for browsing, searching, and analyzing your memory system. No extra dependencies — it uses Starlette/uvicorn (already installed via `mcp[cli]`).
+
+```bash
+python memroach_web.py          # Starts on http://127.0.0.1:8080
+python memroach_web.py --port 9090  # Custom port
+```
+
+### Dashboard
+
+Overview of your memory system — file counts by type, total storage, recent activity, and quick stats.
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+### Browse
+
+Paginated file browser with sorting by name, type, size, or sync date. Click any file to open the Memory Viewer with full content, version history, and knowledge graph links.
+
+![Browse](docs/screenshots/browse.png)
+
+### Search
+
+Hybrid semantic + keyword search across all memories. Results show file path, type, size, and relevance score.
+
+![Search](docs/screenshots/search.png)
+
+### Knowledge Graph
+
+Interactive D3.js force-directed graph visualization of all memory links. Nodes are color-coded by file type, edges labeled with relationship type (relates_to, supersedes, duplicates, etc.).
+
+![Knowledge Graph](docs/screenshots/graph.png)
+
+### Timeline
+
+Chronological history of all memory operations (create, update, delete) across all files. Shows operation type, file path, and timestamp.
+
+![Timeline](docs/screenshots/timeline.png)
+
+### Team
+
+Browse and search team-shared memories. Shows visibility status and allows filtering by team vs private.
+
+![Team](docs/screenshots/team.png)
+
+### Compaction
+
+Identifies old, large, rarely-accessed memories that are candidates for summarization. Shows age, size, and access count for each candidate.
+
+![Compaction](docs/screenshots/compact.png)
+
+### Sync Status
+
+Real-time view of sync state — last push/pull times, machine identity, pending changes, and daemon status.
+
+![Sync Status](docs/screenshots/sync.png)
+
+### Insights
+
+#### Memory Health
+
+Health report card with colored indicators for stale memories, orphaned files (no graph links), oversized files, version churn, and embedding coverage.
+
+![Memory Health](docs/screenshots/insights-health.png)
+
+#### Growth & Activity Analytics
+
+Daily activity charts showing creates, updates, and deletes over time. Includes machine activity breakdown and most-churned files.
+
+![Analytics](docs/screenshots/insights-analytics.png)
+
+#### Topic Clusters
+
+K-means clustering on embedding vectors groups memories into topics. Each cluster shows an auto-generated label (top keywords), file count, and representative files.
+
+![Topics](docs/screenshots/insights-topics.png)
+
+#### Duplicate Detection
+
+Finds near-duplicate memories using embedding cosine similarity. Shows side-by-side snippets with similarity scores. Includes a merge button to consolidate duplicates directly from the UI.
+
+![Duplicates](docs/screenshots/insights-duplicates.png)
+
+### Discover
+
+Social-media-style "rediscover" feed that surfaces old, forgotten memories. Weighted random selection favors older and less-accessed files. Click "Next" to swipe through your memory archive.
+
+![Discover](docs/screenshots/discover.png)
+
 ## File Layout
 
 ```
@@ -386,11 +475,13 @@ memroach/
 ├── memroach_mcp_server.py     # MCP server (16 tools)
 ├── memroach_sync.py           # File sync client + CLI + hooks
 ├── memroach_daemon.py         # Background sync daemon
+├── memroach_web.py            # Web UI dashboard (single-file SPA)
 ├── memroach_embed.py          # Shared embedding module (OpenAI + Voyage)
 ├── memroach_admin.py          # User management (non-IdP fallback)
 ├── memroach_config.json       # Config (gitignored)
 ├── schema/
 │   └── memroach_schema.sql    # CockroachDB DDL (7 tables)
+├── docs/screenshots/          # Web UI screenshots
 ├── requirements.txt           # Python dependencies
 ├── .claude/skills/setup.md    # Interactive setup wizard
 └── README.md
