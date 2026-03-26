@@ -41,123 +41,20 @@ Optional AES encryption for stored content using CockroachDB's native `encrypt()
 
 ## Quick Start
 
-### 1. Install
-
 ```bash
 git clone https://github.com/biplav-crl/memroach.git
 cd memroach
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
 ```
 
-### 2. Configure
+Then run the interactive setup wizard from Claude Code:
 
-```bash
-cp memroach_config.json.example memroach_config.json
+```
+/setup
 ```
 
-Edit `memroach_config.json` with your CockroachDB credentials:
+The wizard walks you through everything — database connection, schema, MCP registration, auto-sync hooks, semantic search, and encryption. It handles both **new database** setup and **connecting to an existing database** (e.g., setting up a second machine).
 
-```json
-{
-  "db_host": "your-cockroachdb-host",
-  "db_port": 26257,
-  "db_user": "your_username",
-  "db_password": "your_password",
-  "db_name": "memroach",
-  "db_sslrootcert": "/path/to/ca.crt"
-}
-```
-
-### 3. Initialize
-
-```bash
-# Apply schema to your CockroachDB instance
-cockroach sql --url "postgresql://user@host:26257/memroach?sslmode=verify-full" \
-  < schema/memroach_schema.sql
-
-# Test connectivity and generate machine_id
-python memroach_sync.py init
-
-# Upload your agent's memories to the database
-python memroach_sync.py push
-```
-
-### 4. Register MCP Server
-
-Add to your `.mcp.json` (Claude Code) or Cursor MCP config:
-
-```json
-{
-  "mcpServers": {
-    "memroach": {
-      "command": "/path/to/memroach/venv/bin/python",
-      "args": ["memroach_mcp_server.py"],
-      "cwd": "/path/to/memroach"
-    }
-  }
-}
-```
-
-### 5. Enable Auto-Sync (Optional)
-
-Add hooks to `~/.claude/settings.json` for automatic push/pull:
-
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "/path/to/memroach/venv/bin/python /path/to/memroach/memroach_sync.py", "timeout": 15 }] }
-    ],
-    "Stop": [
-      { "hooks": [{ "type": "command", "command": "/path/to/memroach/venv/bin/python /path/to/memroach/memroach_sync.py", "timeout": 10 }] }
-    ],
-    "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "/path/to/memroach/venv/bin/python /path/to/memroach/memroach_sync.py", "timeout": 10 }] }
-    ]
-  }
-}
-```
-
-| Event | Action |
-|-------|--------|
-| `UserPromptSubmit` | Auto-pull once per session (first prompt only) |
-| `Stop` | Auto-push in background after Claude responds |
-| `SessionEnd` | Final push before session closes |
-
-The hook handler **never crashes or blocks** — it exits cleanly on missing config, unreachable DB, or any error.
-
-### 6. Enable Semantic Search (Optional)
-
-Set `embed_api_key` in `memroach_config.json`:
-
-```json
-{
-  "embed_model": "text-embedding-3-small",
-  "embed_api_key": "sk-..."
-}
-```
-
-Supports OpenAI (`text-embedding-3-small`) and Voyage AI (`voyage-3`).
-
-### 7. Enable Encryption (Optional)
-
-```bash
-# Generate a key
-python3 -c "import os; print(os.urandom(32).hex())"
-```
-
-```json
-{
-  "encryption_enabled": true,
-  "encryption_key": "your-64-char-hex-key"
-}
-```
-
-Encrypts `content_bytes` and `chunk_text` at rest. Existing unencrypted data remains readable.
-
-Or use the interactive setup wizard: `/setup` (from Claude Code in this project).
+> **Not using Claude Code?** See [Manual Setup](#manual-setup) below for step-by-step shell commands.
 
 ---
 
@@ -467,6 +364,136 @@ python memroach_admin.py create-user alice
 python memroach_admin.py list-users
 python memroach_admin.py user-stats alice
 ```
+
+## Manual Setup
+
+For users not using Claude Code, or who prefer manual configuration.
+
+### 1. Install
+
+```bash
+git clone https://github.com/biplav-crl/memroach.git
+cd memroach
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. Configure
+
+```bash
+cp memroach_config.json.example memroach_config.json
+```
+
+Edit `memroach_config.json` with your CockroachDB credentials:
+
+```json
+{
+  "db_host": "your-cockroachdb-host",
+  "db_port": 26257,
+  "db_user": "your_username",
+  "db_password": "your_password",
+  "db_name": "memroach",
+  "db_sslrootcert": "/path/to/ca.crt"
+}
+```
+
+### 3. Initialize
+
+**New database:**
+```bash
+# Apply schema
+cockroach sql --url "postgresql://user@host:26257/memroach?sslmode=verify-full" \
+  < schema/memroach_schema.sql
+
+# Test connectivity, generate machine_id
+python memroach_sync.py init
+
+# Upload your agent's memories
+python memroach_sync.py push
+```
+
+**Existing database (second machine):**
+```bash
+# Copy memroach_config.json from your other machine, then clear machine_id
+# (a new unique ID will be auto-generated)
+
+# Test connectivity, generate machine_id
+python memroach_sync.py init
+
+# Download memories from the database
+python memroach_sync.py pull
+```
+
+### 4. Register MCP Server
+
+Add to your `.mcp.json` (Claude Code) or Cursor MCP config:
+
+```json
+{
+  "mcpServers": {
+    "memroach": {
+      "command": "/path/to/memroach/venv/bin/python",
+      "args": ["memroach_mcp_server.py"],
+      "cwd": "/path/to/memroach"
+    }
+  }
+}
+```
+
+### 5. Auto-Sync Hooks (Optional)
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "/path/to/memroach/venv/bin/python /path/to/memroach/memroach_sync.py", "timeout": 15 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "/path/to/memroach/venv/bin/python /path/to/memroach/memroach_sync.py", "timeout": 10 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "/path/to/memroach/venv/bin/python /path/to/memroach/memroach_sync.py", "timeout": 10 }] }
+    ]
+  }
+}
+```
+
+| Event | Action |
+|-------|--------|
+| `UserPromptSubmit` | Auto-pull once per session (first prompt only) |
+| `Stop` | Auto-push in background after Claude responds |
+| `SessionEnd` | Final push before session closes |
+
+The hook handler **never crashes or blocks** — exits cleanly on missing config, unreachable DB, or any error.
+
+### 6. Semantic Search (Optional)
+
+```json
+{
+  "embed_model": "text-embedding-3-small",
+  "embed_api_key": "sk-..."
+}
+```
+
+Supports OpenAI (`text-embedding-3-small`) and Voyage AI (`voyage-3`).
+
+### 7. Encryption (Optional)
+
+```bash
+python3 -c "import os; print(os.urandom(32).hex())"
+```
+
+```json
+{
+  "encryption_enabled": true,
+  "encryption_key": "your-64-char-hex-key"
+}
+```
+
+Encrypts `content_bytes` and `chunk_text` at rest. Existing unencrypted data remains readable.
 
 ## File Layout
 
