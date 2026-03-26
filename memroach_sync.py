@@ -311,23 +311,36 @@ def cmd_push(config: dict, force: bool = False, dry_run: bool = False, verbose: 
                     print(f"  CONFLICT: {f['path']} (version mismatch, use --force)")
                 continue
         else:
-            # Insert or force-update
-            conn.run(
-                "UPSERT INTO memroach_files "
-                "(user_name, machine_id, file_path, file_type, content_hash, "
-                "file_size, file_mtime, version, synced_at) "
-                "VALUES (:user, :machine, :path, :ftype, :hash, :size, :mtime, "
-                "COALESCE((SELECT version FROM memroach_files "
-                "WHERE user_name = :user AND machine_id = :machine AND file_path = :path), 0) + 1, "
-                "now())",
-                user=user,
-                machine=machine_id,
-                path=f["path"],
-                ftype=f["type"],
+            # Force-update existing or insert new
+            updated = conn.run(
+                "UPDATE memroach_files SET "
+                "content_hash = :hash, file_size = :size, file_mtime = :mtime, "
+                "file_type = :ftype, version = version + 1, synced_at = now() "
+                "WHERE user_name = :user AND machine_id = :machine AND file_path = :path",
                 hash=f["hash"],
                 size=f["size"],
                 mtime=f["mtime_iso"],
+                ftype=f["type"],
+                user=user,
+                machine=machine_id,
+                path=f["path"],
             )
+            # Check if row existed; if not, insert
+            existing = conn.run(
+                "SELECT 1 FROM memroach_files "
+                "WHERE user_name = :user AND machine_id = :machine AND file_path = :path",
+                user=user, machine=machine_id, path=f["path"],
+            )
+            if not existing:
+                conn.run(
+                    "INSERT INTO memroach_files "
+                    "(user_name, machine_id, file_path, file_type, content_hash, "
+                    "file_size, file_mtime, version, synced_at) "
+                    "VALUES (:user, :machine, :path, :ftype, :hash, :size, :mtime, 1, now())",
+                    user=user, machine=machine_id, path=f["path"],
+                    ftype=f["type"], hash=f["hash"], size=f["size"],
+                    mtime=f["mtime_iso"],
+                )
 
         pushed += 1
         total_bytes += f["size"]
