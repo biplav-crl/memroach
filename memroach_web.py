@@ -21,6 +21,12 @@ from pathlib import Path
 import numpy as np
 import pg8000.native
 from decimal import Decimal
+
+try:
+    from memroach_crypto import encrypt_blob, decrypt_blob
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, HTMLResponse
@@ -264,8 +270,10 @@ async def api_file_detail(request: Request) -> JSONResponse:
         return SafeJSONResponse({"error": "Not found"}, status_code=404)
 
     r = rows[0]
+    config = _load_config()
     try:
-        content = gzip.decompress(r[7]).decode("utf-8")
+        decrypted = decrypt_blob(conn, r[7], config) if HAS_CRYPTO else r[7]
+        content = gzip.decompress(decrypted).decode("utf-8")
     except Exception:
         content = "[Binary content]"
 
@@ -326,7 +334,9 @@ async def api_file_history_content(request: Request) -> JSONResponse:
         return SafeJSONResponse({"error": "Blob not found"}, status_code=404)
 
     try:
-        content = gzip.decompress(blob[0][0]).decode("utf-8")
+        config = _load_config()
+        decrypted = decrypt_blob(conn, blob[0][0], config) if HAS_CRYPTO else blob[0][0]
+        content = gzip.decompress(decrypted).decode("utf-8")
     except Exception:
         content = "[Binary content]"
 
@@ -390,13 +400,12 @@ async def api_search(request: Request) -> JSONResponse:
     except Exception:
         pass
 
-    # Keyword fallback
+    # Keyword fallback (path-only search — content search not possible with encryption)
     rows = conn.run(
         "SELECT f.file_path, f.file_type, f.file_size, f.visibility, f.synced_at "
         "FROM memroach_files f "
-        "JOIN memroach_blobs b ON f.content_hash = b.content_hash "
         "WHERE f.user_name = :user AND f.is_deleted = false "
-        "AND (f.file_path ILIKE :q OR b.content_bytes::STRING ILIKE :q) "
+        "AND f.file_path ILIKE :q "
         "ORDER BY f.synced_at DESC LIMIT :lim",
         user=user, q=f"%{query}%", lim=limit,
     )
@@ -1026,12 +1035,17 @@ async def api_insights_discover(request: Request) -> JSONResponse:
     r, _, acc_count, days_old = chosen
 
     # Fetch content only for the chosen file
+    config = _load_config()
     blob = conn.run(
         "SELECT content_bytes FROM memroach_blobs WHERE content_hash = :hash",
         hash=r[4],
     )
     try:
-        content = gzip.decompress(blob[0][0]).decode("utf-8") if blob else "[Content not found]"
+        if blob:
+            decrypted = decrypt_blob(conn, blob[0][0], config) if HAS_CRYPTO else blob[0][0]
+            content = gzip.decompress(decrypted).decode("utf-8")
+        else:
+            content = "[Content not found]"
     except Exception:
         content = "[Binary content]"
 
@@ -1091,9 +1105,12 @@ async def api_merge(request: Request) -> JSONResponse:
     if not rows_a or not rows_b:
         return SafeJSONResponse({"error": "One or both files not found"}, status_code=404)
 
+    config = _load_config()
     try:
-        content_a = gzip.decompress(rows_a[0][0]).decode("utf-8")
-        content_b = gzip.decompress(rows_b[0][0]).decode("utf-8")
+        dec_a = decrypt_blob(conn, rows_a[0][0], config) if HAS_CRYPTO else rows_a[0][0]
+        dec_b = decrypt_blob(conn, rows_b[0][0], config) if HAS_CRYPTO else rows_b[0][0]
+        content_a = gzip.decompress(dec_a).decode("utf-8")
+        content_b = gzip.decompress(dec_b).decode("utf-8")
     except Exception:
         return SafeJSONResponse({"error": "Cannot decode file contents"}, status_code=500)
 
@@ -1102,7 +1119,8 @@ async def api_merge(request: Request) -> JSONResponse:
 
     # Store merged content
     import hashlib
-    content_bytes = gzip.compress(merged.encode("utf-8"))
+    compressed = gzip.compress(merged.encode("utf-8"))
+    blob_data = encrypt_blob(conn, compressed, config) if HAS_CRYPTO else compressed
     content_hash = hashlib.sha256(merged.encode("utf-8")).hexdigest()
 
     # Insert blob
@@ -1110,11 +1128,8 @@ async def api_merge(request: Request) -> JSONResponse:
         "INSERT INTO memroach_blobs (content_hash, content_bytes, original_size) "
         "VALUES (:hash, :data, :size) "
         "ON CONFLICT (content_hash) DO NOTHING",
-        hash=content_hash, data=content_bytes, size=len(merged),
+        hash=content_hash, data=blob_data, size=len(merged),
     )
-
-    # Update file_a with merged content
-    config = _load_config()
     machine_id = config.get("machine_id", "web-ui")
     conn.run(
         "UPDATE memroach_files SET content_hash = :hash, file_size = :size, "

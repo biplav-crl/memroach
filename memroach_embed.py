@@ -12,6 +12,12 @@ from typing import Optional
 
 import numpy as np
 
+try:
+    from memroach_crypto import encrypt_text, decrypt_text
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
+
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "memroach_config.json"
 EMBED_DIM = 1024  # Must match VECTOR(1024) in schema
@@ -168,6 +174,8 @@ def hybrid_search(conn, user: str, query_embedding: list[float],
         visibility: filter by visibility ('team' for team-only search)
         owner: filter by owner (None = current user)
     """
+    config = _load_config()
+
     # Vector search: get top candidates from embeddings
     query_user = owner if owner else user
     vis_filter = ""
@@ -200,7 +208,8 @@ def hybrid_search(conn, user: str, query_embedding: list[float],
     seen_paths = set()
 
     for row in vector_results:
-        path, chunk_text, embedding_str, ftype, fsize, vis, synced_at = row
+        path, chunk_text_raw, embedding_str, ftype, fsize, vis, synced_at = row
+        chunk_text = decrypt_text(conn, chunk_text_raw, config) if HAS_CRYPTO else chunk_text_raw
 
         # Parse stored embedding
         try:
@@ -315,6 +324,7 @@ def embed_and_store(conn, user: str, file_path: str, content: str,
     for chunk, embedding in zip(chunks, embeddings):
         # Convert embedding to string format for VECTOR type
         vec_str = "[" + ",".join(str(v) for v in embedding) + "]"
+        stored_text = encrypt_text(conn, chunk["chunk_text"], config) if HAS_CRYPTO else chunk["chunk_text"]
         conn.run(
             "UPSERT INTO memroach_embeddings "
             "(user_name, file_path, content_hash, embedding, chunk_index, chunk_text) "
@@ -324,7 +334,7 @@ def embed_and_store(conn, user: str, file_path: str, content: str,
             hash=content_hash,
             vec=vec_str,
             idx=chunk["chunk_index"],
-            text=chunk["chunk_text"],
+            text=stored_text,
         )
         stored += 1
 

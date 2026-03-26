@@ -2,6 +2,8 @@
 -- Unkillable memory for AI agents
 
 -- Content-addressable blob store (deduplicated across machines/users)
+-- Note: content_bytes may be optionally AES-encrypted at the application layer
+-- (see encryption_enabled in memroach_config.json)
 CREATE TABLE IF NOT EXISTS memroach_blobs (
     content_hash STRING(64) PRIMARY KEY,
     content_bytes BYTES NOT NULL,

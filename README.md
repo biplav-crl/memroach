@@ -361,13 +361,55 @@ The hook handler **never crashes or blocks**, even if:
   "embed_model": "text-embedding-3-small",
   "embed_api_key": "",
   "exclude_patterns": [],
-  "max_file_size_mb": 50
+  "max_file_size_mb": 50,
+  "encryption_enabled": false,
+  "encryption_key": ""
 }
 ```
 
 - `machine_id` — auto-generated UUID on first run. Do not share across machines.
 - `embed_model` — `text-embedding-3-small` (OpenAI) or `voyage-3` (Voyage AI)
 - `embed_api_key` — leave empty to disable hybrid search (keyword-only fallback)
+- `encryption_enabled` — set to `true` to encrypt blob content and embedding text at rest
+- `encryption_key` — AES key (hex-encoded, 16/24/32 bytes). Leave empty when encryption is disabled.
+
+## Column-Level Encryption
+
+MemRoach supports optional AES encryption for content stored in CockroachDB, using CockroachDB's native `encrypt()`/`decrypt()` SQL functions.
+
+### What gets encrypted
+
+| Column | Encrypted | Purpose |
+|--------|-----------|---------|
+| `memroach_blobs.content_bytes` | Yes | File content (memories, skills, configs) |
+| `memroach_embeddings.chunk_text` | Yes | Text snippets used for search display |
+| `memroach_embeddings.embedding` | No | Vectors alone don't reveal content |
+| `memroach_files.*` | No | Metadata (paths, sizes, timestamps) |
+
+### Encryption flow
+
+```
+Write: raw content → SHA256 hash → gzip compress → AES encrypt → store
+Read:  fetch → AES decrypt → gzip decompress → raw content
+```
+
+Hash is computed before compression, so content deduplication works regardless of encryption.
+
+### Enabling encryption
+
+1. Generate a key: `python3 -c "import os; print(os.urandom(32).hex())"`
+2. Add to `memroach_config.json`:
+   ```json
+   {
+     "encryption_enabled": true,
+     "encryption_key": "your-64-char-hex-key"
+   }
+   ```
+3. New writes are automatically encrypted. Existing unencrypted data remains readable (backward-compatible reads).
+
+### Backward compatibility
+
+When encryption is enabled, reads automatically detect whether data is encrypted or plaintext (via gzip magic byte check) and handle both. This means you can enable encryption at any time without migrating existing data.
 
 ## How Claude Uses MemRoach
 
@@ -483,6 +525,7 @@ memroach/
 ├── memroach_sync.py           # File sync client + CLI + hooks
 ├── memroach_daemon.py         # Background sync daemon
 ├── memroach_web.py            # Web UI dashboard (single-file SPA)
+├── memroach_crypto.py          # Optional column-level encryption (AES)
 ├── memroach_embed.py          # Shared embedding module (OpenAI + Voyage)
 ├── memroach_admin.py          # User management (non-IdP fallback)
 ├── memroach_config.json       # Config (gitignored)

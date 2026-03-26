@@ -12,5 +12,7 @@
   "embed_model": "voyage-3",
   "embed_api_key": "",
   "exclude_patterns": [],
-  "max_file_size_mb": 50
+  "max_file_size_mb": 50,
+  "encryption_enabled": false,
+  "encryption_key": ""
 }

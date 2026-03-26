@@ -31,6 +31,13 @@ try:
 except ImportError:
     HAS_EMBED = False
 
+# Optional: encryption support
+try:
+    from memroach_crypto import encrypt_blob, decrypt_blob
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
+
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "memroach_config.json"
 CLAUDE_DIR = Path.home() / ".claude"
@@ -308,12 +315,13 @@ def cmd_push(config: dict, force: bool = False, dry_run: bool = False, verbose: 
             with open(f["abs_path"], "rb") as fh:
                 raw = fh.read()
             compressed = gzip.compress(raw)
+            blob_data = encrypt_blob(conn, compressed, config) if HAS_CRYPTO else compressed
             conn.run(
                 "INSERT INTO memroach_blobs (content_hash, content_bytes, original_size) "
                 "VALUES (:hash, :data, :size) "
                 "ON CONFLICT (content_hash) DO NOTHING",
                 hash=f["hash"],
-                data=compressed,
+                data=blob_data,
                 size=len(raw),
             )
 
@@ -609,7 +617,8 @@ def cmd_pull(config: dict, target: Optional[str] = None, force: bool = False,
                 print(f"  ERROR: blob not found for {f['path']}")
             continue
 
-        raw = gzip.decompress(compressed)
+        decrypted = decrypt_blob(conn, compressed, config) if HAS_CRYPTO else compressed
+        raw = gzip.decompress(decrypted)
         local_path = target_dir / f["path"]
         local_path.parent.mkdir(parents=True, exist_ok=True)
         with open(local_path, "wb") as fh:
@@ -627,7 +636,8 @@ def cmd_pull(config: dict, target: Optional[str] = None, force: bool = False,
         if not compressed:
             continue
 
-        remote_raw = gzip.decompress(compressed)
+        decrypted = decrypt_blob(conn, compressed, config) if HAS_CRYPTO else compressed
+        remote_raw = gzip.decompress(decrypted)
         local_path = target_dir / f["path"]
 
         # Try merge for memory/skill .md files

@@ -25,6 +25,12 @@ try:
 except ImportError:
     HAS_EMBED = False
 
+try:
+    from memroach_crypto import encrypt_blob, decrypt_blob, encrypt_text, decrypt_text
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
+
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "memroach_config.json"
 
@@ -169,6 +175,7 @@ def memroach_get(file_path: str) -> dict[str, Any]:
     """
     conn = _get_conn()
     user = _get_user()
+    config = _load_config()
 
     rows = conn.run(
         "SELECT f.file_path, f.file_type, f.file_size, f.visibility, f.version, "
@@ -187,7 +194,8 @@ def memroach_get(file_path: str) -> dict[str, Any]:
     row = rows[0]
     compressed = row[7]
     try:
-        content = gzip.decompress(compressed).decode("utf-8", errors="replace")
+        decrypted = decrypt_blob(conn, compressed, config) if HAS_CRYPTO else compressed
+        content = gzip.decompress(decrypted).decode("utf-8", errors="replace")
     except Exception:
         content = "[binary content]"
 
@@ -231,13 +239,14 @@ def memroach_store(file_path: str, content: str, file_type: str = "memory",
     raw = content.encode("utf-8")
     content_hash = hashlib.sha256(raw).hexdigest()
     compressed = gzip.compress(raw)
+    blob_data = encrypt_blob(conn, compressed, config) if HAS_CRYPTO else compressed
 
     # Upsert blob
     conn.run(
         "INSERT INTO memroach_blobs (content_hash, content_bytes, original_size) "
         "VALUES (:hash, :data, :size) ON CONFLICT (content_hash) DO NOTHING",
         hash=content_hash,
-        data=compressed,
+        data=blob_data,
         size=len(raw),
     )
 
@@ -591,7 +600,8 @@ def memroach_context(topic: str, limit: int = 5,
             continue
 
         try:
-            content = gzip.decompress(rows[0][0]).decode("utf-8", errors="replace")
+            decrypted = decrypt_blob(conn, rows[0][0], config) if HAS_CRYPTO else rows[0][0]
+            content = gzip.decompress(decrypted).decode("utf-8", errors="replace")
         except Exception:
             continue
 
@@ -799,6 +809,7 @@ def memroach_compact(max_age_days: int = 30, min_size: int = 2000,
     """
     conn = _get_conn()
     user = _get_user()
+    config = _load_config()
 
     # Find memory/skill files that are old, large, and rarely accessed
     rows = conn.run(
@@ -822,7 +833,8 @@ def memroach_compact(max_age_days: int = 30, min_size: int = 2000,
     for row in rows:
         path, ftype, fsize, synced_at, compressed, last_access, access_count = row
         try:
-            content = gzip.decompress(compressed).decode("utf-8", errors="replace")
+            decrypted = decrypt_blob(conn, compressed, config) if HAS_CRYPTO else compressed
+            content = gzip.decompress(decrypted).decode("utf-8", errors="replace")
         except Exception:
             continue
 
@@ -869,15 +881,17 @@ def memroach_merge(paths: list[str], merged_content: str,
     target_path = merged_path or paths[0]
 
     # Store the merged content
+    config = _load_config()
     raw = merged_content.encode("utf-8")
     content_hash = hashlib.sha256(raw).hexdigest()
     compressed = gzip.compress(raw)
+    blob_data = encrypt_blob(conn, compressed, config) if HAS_CRYPTO else compressed
 
     # Upsert blob
     conn.run(
         "INSERT INTO memroach_blobs (content_hash, content_bytes, original_size) "
         "VALUES (:hash, :data, :size) ON CONFLICT (content_hash) DO NOTHING",
-        hash=content_hash, data=compressed, size=len(raw),
+        hash=content_hash, data=blob_data, size=len(raw),
     )
 
     # Upsert file
@@ -1029,7 +1043,8 @@ def memroach_prime(project_hint: Optional[str] = None,
             continue
 
         try:
-            content = gzip.decompress(rows[0][0]).decode("utf-8", errors="replace")
+            decrypted = decrypt_blob(conn, rows[0][0], config) if HAS_CRYPTO else rows[0][0]
+            content = gzip.decompress(decrypted).decode("utf-8", errors="replace")
         except Exception:
             continue
 
