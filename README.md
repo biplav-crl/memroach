@@ -369,6 +369,16 @@ The hook handler **never crashes or blocks**, even if:
 - `embed_model` — `text-embedding-3-small` (OpenAI) or `voyage-3` (Voyage AI)
 - `embed_api_key` — leave empty to disable hybrid search (keyword-only fallback)
 
+## How Claude Uses MemRoach
+
+MemRoach is designed to work transparently with Claude's existing memory system:
+
+- **Saving memories** — Claude saves to `~/.claude/memory/` files as normal. Sync hooks automatically push to CockroachDB. No behavior change needed.
+- **Retrieving memories** — Claude uses MCP tools (`memroach_search`, `memroach_prime`, `memroach_context`) for richer results than reading local files.
+- **Advanced features** — Claude calls MCP tools for things files can't do: team sharing (`memroach_share`), knowledge graph links (`memroach_link`), duplicate consolidation (`memroach_consolidate`, `memroach_merge`).
+
+See `CLAUDE.md` for the full decision guide.
+
 ## File Layout
 
 ```
