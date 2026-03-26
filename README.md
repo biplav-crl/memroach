@@ -485,8 +485,7 @@ memroach/
 │   └── memroach_schema.sql    # CockroachDB DDL (7 tables)
 ├── docs/screenshots/          # Web UI screenshots
 ├── requirements.txt           # Python dependencies
-├── .claude/skills/setup.md        # Interactive setup wizard
-├── .claude/skills/memroach_web.md # /memroach_web shortcut — launch web UI
+├── .claude/skills/setup.md    # Interactive setup wizard
 └── README.md
 ```
 
