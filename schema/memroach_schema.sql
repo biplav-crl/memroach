@@ -60,6 +60,31 @@ CREATE TABLE IF NOT EXISTS memroach_history (
 
 CREATE INDEX IF NOT EXISTS idx_memroach_history_user_path ON memroach_history (user_name, file_path, created_at DESC);
 
+-- Graph links between memories (relates_to, duplicates, supersedes, caused_by)
+CREATE TABLE IF NOT EXISTS memroach_links (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_name STRING NOT NULL,
+    from_path STRING NOT NULL,
+    to_path STRING NOT NULL,
+    link_type STRING NOT NULL DEFAULT 'relates_to',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_name, from_path, to_path, link_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memroach_links_from ON memroach_links (user_name, from_path);
+CREATE INDEX IF NOT EXISTS idx_memroach_links_to ON memroach_links (user_name, to_path);
+
+-- Access tracking for memory decay / compaction
+CREATE TABLE IF NOT EXISTS memroach_access (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_name STRING NOT NULL,
+    file_path STRING NOT NULL,
+    access_type STRING NOT NULL DEFAULT 'read',
+    accessed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_memroach_access_user_path ON memroach_access (user_name, file_path, accessed_at DESC);
+
 -- Audit log
 CREATE TABLE IF NOT EXISTS memroach_log (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,

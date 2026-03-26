@@ -191,6 +191,16 @@ def memroach_get(file_path: str) -> dict[str, Any]:
     except Exception:
         content = "[binary content]"
 
+    # Track access for memory decay
+    try:
+        conn.run(
+            "INSERT INTO memroach_access (user_name, file_path, access_type) "
+            "VALUES (:user, :path, 'read')",
+            user=user, path=file_path,
+        )
+    except Exception:
+        pass  # Non-critical
+
     return {
         "path": row[0],
         "type": row[1],
@@ -648,6 +658,409 @@ def memroach_changes(since_minutes: int = 60, limit: int = 20) -> dict[str, Any]
         "current_machine": machine_id,
         "count": len(changes),
         "changes": changes,
+    }
+
+
+@mcp.tool()
+def memroach_link(from_path: str, to_path: str,
+                  link_type: str = "relates_to") -> dict[str, Any]:
+    """Create a typed link between two memories in the knowledge graph.
+
+    Link types:
+    - relates_to: loose association ("see also")
+    - duplicates: marks a memory as duplicate of another
+    - supersedes: this memory replaces an older one
+    - caused_by: this memory was created because of another
+    - refines: this memory elaborates on another
+
+    Args:
+        from_path: Source memory path
+        to_path: Target memory path
+        link_type: One of: relates_to, duplicates, supersedes, caused_by, refines
+    """
+    valid_types = ("relates_to", "duplicates", "supersedes", "caused_by", "refines")
+    if link_type not in valid_types:
+        return {"error": f"Invalid link_type. Must be one of: {', '.join(valid_types)}"}
+
+    conn = _get_conn()
+    user = _get_user()
+
+    try:
+        conn.run(
+            "INSERT INTO memroach_links (user_name, from_path, to_path, link_type) "
+            "VALUES (:user, :from, :to, :type) "
+            "ON CONFLICT (user_name, from_path, to_path, link_type) DO NOTHING",
+            user=user, **{"from": from_path, "to": to_path, "type": link_type},
+        )
+        # For relates_to, create bidirectional link
+        if link_type == "relates_to":
+            conn.run(
+                "INSERT INTO memroach_links (user_name, from_path, to_path, link_type) "
+                "VALUES (:user, :from, :to, 'relates_to') "
+                "ON CONFLICT (user_name, from_path, to_path, link_type) DO NOTHING",
+                user=user, **{"from": to_path, "to": from_path},
+            )
+    except Exception as e:
+        return {"error": str(e)}
+
+    return {"linked": True, "from": from_path, "to": to_path, "type": link_type}
+
+
+@mcp.tool()
+def memroach_unlink(from_path: str, to_path: str,
+                    link_type: Optional[str] = None) -> dict[str, Any]:
+    """Remove a link between two memories.
+
+    Args:
+        from_path: Source memory path
+        to_path: Target memory path
+        link_type: Specific link type to remove, or None to remove all links between them
+    """
+    conn = _get_conn()
+    user = _get_user()
+
+    if link_type:
+        conn.run(
+            "DELETE FROM memroach_links "
+            "WHERE user_name = :user AND from_path = :from AND to_path = :to AND link_type = :type",
+            user=user, **{"from": from_path, "to": to_path, "type": link_type},
+        )
+        # Remove reverse for relates_to
+        if link_type == "relates_to":
+            conn.run(
+                "DELETE FROM memroach_links "
+                "WHERE user_name = :user AND from_path = :from AND to_path = :to AND link_type = 'relates_to'",
+                user=user, **{"from": to_path, "to": from_path},
+            )
+    else:
+        conn.run(
+            "DELETE FROM memroach_links "
+            "WHERE user_name = :user AND "
+            "((from_path = :from AND to_path = :to) OR (from_path = :to AND to_path = :from))",
+            user=user, **{"from": from_path, "to": to_path},
+        )
+
+    return {"unlinked": True, "from": from_path, "to": to_path}
+
+
+@mcp.tool()
+def memroach_graph(file_path: str) -> dict[str, Any]:
+    """Show all links (relationships) for a memory in the knowledge graph.
+
+    Returns incoming and outgoing links with their types.
+
+    Args:
+        file_path: Path to query relationships for
+    """
+    conn = _get_conn()
+    user = _get_user()
+
+    outgoing = conn.run(
+        "SELECT to_path, link_type, created_at FROM memroach_links "
+        "WHERE user_name = :user AND from_path = :path "
+        "ORDER BY created_at DESC",
+        user=user, path=file_path,
+    )
+    incoming = conn.run(
+        "SELECT from_path, link_type, created_at FROM memroach_links "
+        "WHERE user_name = :user AND to_path = :path "
+        "ORDER BY created_at DESC",
+        user=user, path=file_path,
+    )
+
+    out_links = [{"path": r[0], "type": r[1],
+                  "created_at": r[2].isoformat() if hasattr(r[2], 'isoformat') else str(r[2])}
+                 for r in outgoing]
+    in_links = [{"path": r[0], "type": r[1],
+                 "created_at": r[2].isoformat() if hasattr(r[2], 'isoformat') else str(r[2])}
+                for r in incoming]
+
+    return {
+        "path": file_path,
+        "outgoing": out_links,
+        "incoming": in_links,
+        "total_links": len(out_links) + len(in_links),
+    }
+
+
+@mcp.tool()
+def memroach_compact(max_age_days: int = 30, min_size: int = 2000,
+                     limit: int = 10) -> dict[str, Any]:
+    """Find old, rarely-accessed memories that are candidates for compaction.
+
+    Returns memories that haven't been accessed recently and are large enough
+    to benefit from summarization. The caller (Claude) should summarize each
+    candidate and store the compact version via memroach_store.
+
+    Args:
+        max_age_days: Consider memories not accessed in this many days (default 30)
+        min_size: Minimum file size in bytes to consider (default 2000)
+        limit: Maximum candidates to return (default 10)
+    """
+    conn = _get_conn()
+    user = _get_user()
+
+    # Find memory/skill files that are old, large, and rarely accessed
+    rows = conn.run(
+        "SELECT f.file_path, f.file_type, f.file_size, f.synced_at, "
+        "b.content_bytes, "
+        "(SELECT MAX(accessed_at) FROM memroach_access a "
+        " WHERE a.user_name = f.user_name AND a.file_path = f.file_path) as last_access, "
+        "(SELECT COUNT(*) FROM memroach_access a "
+        " WHERE a.user_name = f.user_name AND a.file_path = f.file_path) as access_count "
+        "FROM memroach_files f "
+        "JOIN memroach_blobs b ON f.content_hash = b.content_hash "
+        "WHERE f.user_name = :user AND f.is_deleted = false "
+        "AND f.file_type IN ('memory', 'skill') "
+        "AND f.file_size >= :min_size "
+        "AND f.synced_at < now() - :age::INTERVAL "
+        "ORDER BY f.file_size DESC LIMIT :lim",
+        user=user, min_size=min_size, age=f"{max_age_days} days", lim=limit,
+    )
+
+    candidates = []
+    for row in rows:
+        path, ftype, fsize, synced_at, compressed, last_access, access_count = row
+        try:
+            content = gzip.decompress(compressed).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        candidates.append({
+            "path": path,
+            "type": ftype,
+            "size": fsize,
+            "synced_at": synced_at.isoformat() if hasattr(synced_at, 'isoformat') else str(synced_at),
+            "last_accessed": last_access.isoformat() if last_access and hasattr(last_access, 'isoformat') else str(last_access) if last_access else "never",
+            "access_count": access_count or 0,
+            "content": content,
+        })
+
+    return {
+        "max_age_days": max_age_days,
+        "min_size_bytes": min_size,
+        "count": len(candidates),
+        "candidates": candidates,
+        "instructions": "For each candidate, summarize the content to ~25% of original size "
+                        "preserving key facts, then call memroach_store with the compact version. "
+                        "The original is preserved in version history.",
+    }
+
+
+@mcp.tool()
+def memroach_merge(paths: list[str], merged_content: str,
+                   merged_path: Optional[str] = None) -> dict[str, Any]:
+    """Merge multiple duplicate or overlapping memories into one.
+
+    Stores the merged content as a new version, marks originals as superseded
+    via graph links, and optionally soft-deletes the duplicates.
+
+    Args:
+        paths: List of file paths to merge (at least 2)
+        merged_content: The combined/merged content to store
+        merged_path: Path for the merged file (defaults to first path in list)
+    """
+    if len(paths) < 2:
+        return {"error": "Need at least 2 paths to merge"}
+
+    conn = _get_conn()
+    user = _get_user()
+
+    target_path = merged_path or paths[0]
+
+    # Store the merged content
+    raw = merged_content.encode("utf-8")
+    content_hash = hashlib.sha256(raw).hexdigest()
+    compressed = gzip.compress(raw)
+
+    # Upsert blob
+    conn.run(
+        "INSERT INTO memroach_blobs (content_hash, content_bytes, original_size) "
+        "VALUES (:hash, :data, :size) ON CONFLICT (content_hash) DO NOTHING",
+        hash=content_hash, data=compressed, size=len(raw),
+    )
+
+    # Upsert file
+    machine_id = "mcp"
+    conn.run(
+        "UPDATE memroach_files SET content_hash = :hash, file_size = :size, "
+        "file_type = 'memory', synced_at = now(), version = version + 1 "
+        "WHERE user_name = :user AND file_path = :path AND is_deleted = false",
+        hash=content_hash, size=len(raw), user=user, path=target_path,
+    )
+    # If target didn't exist, insert
+    existing = conn.run(
+        "SELECT 1 FROM memroach_files "
+        "WHERE user_name = :user AND file_path = :path AND is_deleted = false",
+        user=user, path=target_path,
+    )
+    if not existing:
+        conn.run(
+            "INSERT INTO memroach_files "
+            "(user_name, machine_id, file_path, file_type, content_hash, "
+            "file_size, file_mtime, version, synced_at) "
+            "VALUES (:user, :machine, :path, 'memory', :hash, :size, now(), 1, now())",
+            user=user, machine=machine_id, path=target_path,
+            hash=content_hash, size=len(raw),
+        )
+
+    # Create supersedes links from merged file to all source files
+    merged_sources = []
+    for path in paths:
+        if path == target_path:
+            continue
+        # Link: target supersedes source
+        try:
+            conn.run(
+                "INSERT INTO memroach_links (user_name, from_path, to_path, link_type) "
+                "VALUES (:user, :from, :to, 'supersedes') "
+                "ON CONFLICT (user_name, from_path, to_path, link_type) DO NOTHING",
+                user=user, **{"from": target_path, "to": path},
+            )
+        except Exception:
+            pass
+
+        # Soft-delete the duplicate
+        conn.run(
+            "UPDATE memroach_files SET is_deleted = true "
+            "WHERE user_name = :user AND file_path = :path",
+            user=user, path=path,
+        )
+        merged_sources.append(path)
+
+    return {
+        "merged_into": target_path,
+        "sources_superseded": merged_sources,
+        "size": len(raw),
+        "hash": content_hash[:12],
+    }
+
+
+@mcp.tool()
+def memroach_prime(project_hint: Optional[str] = None,
+                   limit: int = 10) -> dict[str, Any]:
+    """Smart context priming — loads the most relevant memories for your current session.
+
+    Combines:
+    1. Recently modified memories (what's fresh)
+    2. Project-relevant memories (if project_hint given)
+    3. Most frequently accessed memories (what you use most)
+    4. Recent changes from other machines (what's new)
+    5. Graph-linked related memories
+
+    Returns full content ready for consumption.
+
+    Args:
+        project_hint: Project directory name or keyword to focus on (e.g., "memroach", "crl-agent")
+        limit: Maximum memories to include (default 10)
+    """
+    conn = _get_conn()
+    user = _get_user()
+    config = _load_config()
+    machine_id = config.get("machine_id", "")
+
+    scored_paths: dict[str, float] = {}
+
+    # Signal 1: Recently modified memories (weight: 1.0)
+    recent = conn.run(
+        "SELECT file_path, synced_at FROM memroach_files "
+        "WHERE user_name = :user AND is_deleted = false "
+        "AND file_type IN ('memory', 'skill') "
+        "ORDER BY synced_at DESC LIMIT :lim",
+        user=user, lim=limit * 2,
+    )
+    for i, row in enumerate(recent):
+        scored_paths[row[0]] = scored_paths.get(row[0], 0) + max(0.5, 1.0 - i * 0.05)
+
+    # Signal 2: Project-relevant (weight: 2.0)
+    if project_hint:
+        project = conn.run(
+            "SELECT file_path FROM memroach_files "
+            "WHERE user_name = :user AND is_deleted = false "
+            "AND file_type IN ('memory', 'skill') "
+            "AND file_path ILIKE :pattern "
+            "ORDER BY synced_at DESC LIMIT :lim",
+            user=user, pattern=f"%{project_hint}%", lim=limit,
+        )
+        for row in project:
+            scored_paths[row[0]] = scored_paths.get(row[0], 0) + 2.0
+
+    # Signal 3: Most accessed (weight: 0.8)
+    frequent = conn.run(
+        "SELECT file_path, COUNT(*) as cnt FROM memroach_access "
+        "WHERE user_name = :user "
+        "GROUP BY file_path ORDER BY cnt DESC LIMIT :lim",
+        user=user, lim=limit,
+    )
+    for row in frequent:
+        scored_paths[row[0]] = scored_paths.get(row[0], 0) + 0.8
+
+    # Signal 4: Recent cross-machine changes (weight: 1.5)
+    cross = conn.run(
+        "SELECT file_path FROM memroach_files "
+        "WHERE user_name = :user AND is_deleted = false "
+        "AND machine_id != :machine "
+        "AND file_type IN ('memory', 'skill') "
+        "AND synced_at > now() - '24 hours'::INTERVAL "
+        "ORDER BY synced_at DESC LIMIT :lim",
+        user=user, machine=machine_id, lim=limit,
+    )
+    for row in cross:
+        scored_paths[row[0]] = scored_paths.get(row[0], 0) + 1.5
+
+    # Rank and take top N
+    ranked = sorted(scored_paths.items(), key=lambda x: x[1], reverse=True)[:limit]
+
+    if not ranked:
+        return {"count": 0, "context": "", "files": []}
+
+    # Fetch content for top files
+    context_parts = []
+    files_included = []
+    for path, score in ranked:
+        rows = conn.run(
+            "SELECT b.content_bytes, f.file_type FROM memroach_files f "
+            "JOIN memroach_blobs b ON f.content_hash = b.content_hash "
+            "WHERE f.user_name = :user AND f.file_path = :path AND f.is_deleted = false "
+            "ORDER BY f.synced_at DESC LIMIT 1",
+            user=user, path=path,
+        )
+        if not rows:
+            continue
+
+        try:
+            content = gzip.decompress(rows[0][0]).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        context_parts.append(f"--- {path} (relevance: {score:.1f}) ---\n{content}")
+        files_included.append({
+            "path": path,
+            "type": rows[0][1],
+            "relevance_score": round(score, 2),
+        })
+
+    # Also fetch graph links for included files to show relationships
+    links_summary = []
+    for f in files_included[:5]:  # Only check top 5 for links
+        link_rows = conn.run(
+            "SELECT to_path, link_type FROM memroach_links "
+            "WHERE user_name = :user AND from_path = :path LIMIT 5",
+            user=user, path=f["path"],
+        )
+        for lr in link_rows:
+            links_summary.append({
+                "from": f["path"], "to": lr[0], "type": lr[1],
+            })
+
+    context_block = "\n\n".join(context_parts)
+
+    return {
+        "count": len(files_included),
+        "files": files_included,
+        "links": links_summary,
+        "context": context_block,
+        "project_hint": project_hint,
     }
 
 
