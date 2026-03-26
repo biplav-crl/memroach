@@ -17,6 +17,7 @@ import subprocess
 import ssl
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -64,8 +65,25 @@ def load_config() -> dict:
 
 
 def get_machine_id(config: dict) -> str:
-    """Get machine identifier."""
-    return config.get("machine_id") or socket.gethostname()
+    """Get or generate a stable machine identifier.
+
+    Uses a UUID stored in memroach_config.json to avoid hostname collisions.
+    Generates one on first run and writes it back to config.
+    """
+    mid = config.get("machine_id")
+    if mid:
+        return mid
+
+    # Generate a new UUID and persist it
+    mid = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+    config["machine_id"] = mid
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+    except OSError:
+        pass  # Can't persist — will regenerate next time, but functional for now
+    return mid
 
 
 def get_connection(config: dict) -> pg8000.native.Connection:
@@ -187,6 +205,32 @@ def cmd_init(config: dict):
             print(f"  Tables: {', '.join(table_names)}")
         else:
             print("  Tables: NOT FOUND — run schema/memroach_schema.sql first")
+
+        # Check for old hostname-based machine_id rows that need migration
+        machine_id = get_machine_id(config)
+        old_hostname = socket.gethostname()
+        if machine_id != old_hostname:
+            old_rows = conn.run(
+                "SELECT COUNT(*) FROM memroach_files "
+                "WHERE user_name = :user AND machine_id = :old",
+                user=config["db_user"], old=old_hostname,
+            )
+            if old_rows and old_rows[0][0] > 0:
+                count = old_rows[0][0]
+                print(f"\n  Found {count} files under old machine_id '{old_hostname}'")
+                print(f"  Migrating to new machine_id '{machine_id}'...")
+                # Delete old hostname rows — next push will repopulate under new ID
+                conn.run(
+                    "DELETE FROM memroach_files "
+                    "WHERE user_name = :user AND machine_id = :old",
+                    user=config["db_user"], old=old_hostname,
+                )
+                conn.run(
+                    "UPDATE memroach_log SET machine_id = :new "
+                    "WHERE user_name = :user AND machine_id = :old",
+                    new=machine_id, user=config["db_user"], old=old_hostname,
+                )
+                print(f"  Deleted {count} old rows. Run 'memroach push --force' to repopulate.")
 
         conn.close()
         print("\nConnection successful.")
@@ -385,11 +429,60 @@ def cmd_push(config: dict, force: bool = False, dry_run: bool = False, verbose: 
         print(f"  {conflicts} conflicts (use --force to overwrite)")
 
 
+def _merge_memory_files(local_content: str, remote_content: str) -> Optional[str]:
+    """Attempt to merge two versions of a memory .md file.
+
+    Uses a section-based merge: splits on frontmatter/headings, keeps unique
+    sections from both, prefers remote for duplicate sections.
+    Returns merged content, or None if merge isn't possible.
+    """
+    # If one is a subset of the other, take the longer one
+    if local_content in remote_content:
+        return remote_content
+    if remote_content in local_content:
+        return local_content
+
+    # Split into sections by markdown headings or frontmatter
+    def split_sections(text: str) -> list[str]:
+        sections = []
+        current = []
+        for line in text.split("\n"):
+            if line.startswith("#") and current:
+                sections.append("\n".join(current))
+                current = [line]
+            else:
+                current.append(line)
+        if current:
+            sections.append("\n".join(current))
+        return sections
+
+    local_sections = split_sections(local_content)
+    remote_sections = split_sections(remote_content)
+
+    # If both have the same number of sections and they mostly overlap, merge
+    remote_set = set(s.strip() for s in remote_sections)
+    local_set = set(s.strip() for s in local_sections)
+
+    # Find sections unique to each
+    only_local = [s for s in local_sections if s.strip() not in remote_set]
+    only_remote = [s for s in remote_sections if s.strip() not in local_set]
+    common = [s for s in remote_sections if s.strip() in local_set]
+
+    if not only_local and not only_remote:
+        return remote_content  # Identical content, different whitespace
+
+    # Merge: common sections (from remote) + local-only + remote-only
+    merged_parts = common + only_local + only_remote
+    return "\n".join(merged_parts)
+
+
 def cmd_pull(config: dict, target: Optional[str] = None, force: bool = False,
-             dry_run: bool = False, verbose: bool = False):
+             dry_run: bool = False, verbose: bool = False, quiet: bool = False):
     """Pull latest files from CockroachDB to disk."""
     user = config["db_user"]
+    machine_id = get_machine_id(config)
     target_dir = Path(target) if target else CLAUDE_DIR
+    state = load_state()
 
     conn = get_connection(config)
 
@@ -404,12 +497,14 @@ def cmd_pull(config: dict, target: Optional[str] = None, force: bool = False,
     )
 
     if not remote_files:
-        print("No files in remote.")
+        if not quiet:
+            print("No files in remote.")
         conn.close()
         return
 
-    # Compare against local
+    # Compare against local with conflict detection
     to_pull = []
+    conflicts = []
     for row in remote_files:
         rel_path, content_hash, file_size, file_mtime, file_type, synced_at, from_machine = row
         local_path = target_dir / rel_path
@@ -419,14 +514,34 @@ def cmd_pull(config: dict, target: Optional[str] = None, force: bool = False,
             if local_hash == content_hash:
                 continue  # Already up to date
 
-            if not force:
-                # Check if local is newer
-                local_mtime = local_path.stat().st_mtime
-                remote_mtime_ts = file_mtime.timestamp() if hasattr(file_mtime, 'timestamp') else 0
-                if local_mtime > remote_mtime_ts:
-                    if verbose:
-                        print(f"  skip (local newer): {rel_path}")
-                    continue
+            # Check if local changed since last sync (conflict detection)
+            cached = state.get(rel_path)
+            local_changed_since_sync = (
+                cached is not None
+                and cached.get("hash") != local_hash
+            )
+            remote_changed_since_sync = (
+                cached is not None
+                and cached.get("hash") != content_hash
+            )
+
+            if local_changed_since_sync and remote_changed_since_sync and not force:
+                # Both sides changed — conflict
+                conflicts.append({
+                    "path": rel_path,
+                    "hash": content_hash,
+                    "size": file_size,
+                    "type": file_type,
+                    "from_machine": from_machine,
+                    "local_hash": local_hash,
+                })
+                continue
+
+            if not force and not remote_changed_since_sync:
+                # Only local changed, remote is same as last sync — skip
+                if verbose:
+                    print(f"  skip (local only changed): {rel_path}")
+                continue
 
         to_pull.append({
             "path": rel_path,
@@ -436,28 +551,31 @@ def cmd_pull(config: dict, target: Optional[str] = None, force: bool = False,
             "from_machine": from_machine,
         })
 
-    if not to_pull:
-        print("Everything up to date.")
+    if not to_pull and not conflicts:
+        if not quiet:
+            print("Everything up to date.")
         conn.close()
         return
 
-    print(f"  {len(to_pull)} files to pull")
+    if not quiet:
+        if to_pull:
+            print(f"  {len(to_pull)} files to pull")
+        if conflicts:
+            print(f"  {len(conflicts)} conflicts detected")
 
     if dry_run:
         for f in to_pull:
             print(f"  would pull: {f['path']} ({f['type']}, {f['size']} bytes, from {f['from_machine']})")
+        for f in conflicts:
+            print(f"  CONFLICT: {f['path']} ({f['type']}) — both local and remote changed")
         conn.close()
         return
 
-    # Fetch blobs and write files
-    pulled = 0
-    total_bytes = 0
-    hashes_needed = list({f["hash"] for f in to_pull})
-
-    # Fetch blobs in batches
+    # Fetch blobs for both pulls and conflicts
+    all_hashes = list({f["hash"] for f in to_pull + conflicts})
     blob_map = {}
-    for i in range(0, len(hashes_needed), 50):
-        batch = hashes_needed[i:i + 50]
+    for i in range(0, len(all_hashes), 50):
+        batch = all_hashes[i:i + 50]
         placeholders = ", ".join(f":h{j}" for j in range(len(batch)))
         params = {f"h{j}": h for j, h in enumerate(batch)}
         rows = conn.run(
@@ -465,13 +583,19 @@ def cmd_pull(config: dict, target: Optional[str] = None, force: bool = False,
             f"WHERE content_hash IN ({placeholders})",
             **params,
         )
-        for content_hash, content_bytes in rows:
-            blob_map[content_hash] = content_bytes
+        for ch, cb in rows:
+            blob_map[ch] = cb
 
+    pulled = 0
+    merged = 0
+    total_bytes = 0
+
+    # Handle clean pulls
     for f in to_pull:
         compressed = blob_map.get(f["hash"])
         if not compressed:
-            print(f"  ERROR: blob not found for {f['path']}")
+            if not quiet:
+                print(f"  ERROR: blob not found for {f['path']}")
             continue
 
         raw = gzip.decompress(compressed)
@@ -485,19 +609,59 @@ def cmd_pull(config: dict, target: Optional[str] = None, force: bool = False,
         if verbose:
             print(f"  pulled: {f['path']} ({f['type']}, from {f['from_machine']})")
 
+    # Handle conflicts — attempt merge for memory .md files, skip others
+    skipped_conflicts = []
+    for f in conflicts:
+        compressed = blob_map.get(f["hash"])
+        if not compressed:
+            continue
+
+        remote_raw = gzip.decompress(compressed)
+        local_path = target_dir / f["path"]
+
+        # Try merge for memory/skill .md files
+        if f["type"] in ("memory", "skill") and f["path"].endswith(".md"):
+            try:
+                local_content = local_path.read_text(errors="replace")
+                remote_content = remote_raw.decode("utf-8", errors="replace")
+                merged_content = _merge_memory_files(local_content, remote_content)
+
+                if merged_content is not None:
+                    local_path.write_text(merged_content)
+                    merged += 1
+                    if verbose or not quiet:
+                        print(f"  merged: {f['path']} (local + remote changes combined)")
+                    continue
+            except Exception:
+                pass  # Fall through to conflict
+
+        # Can't merge — save remote as .conflict file
+        conflict_path = local_path.with_suffix(local_path.suffix + ".conflict")
+        with open(conflict_path, "wb") as fh:
+            fh.write(remote_raw)
+        skipped_conflicts.append(f["path"])
+        if not quiet:
+            print(f"  CONFLICT: {f['path']} — remote saved as {conflict_path.name}")
+
     # Log the operation
-    machine_id = get_machine_id(config)
     conn.run(
         "INSERT INTO memroach_log (user_name, machine_id, operation, files_changed, bytes_transferred) "
         "VALUES (:user, :machine, 'pull', :count, :bytes)",
         user=user,
         machine=machine_id,
-        count=pulled,
+        count=pulled + merged,
         bytes=total_bytes,
     )
 
     conn.close()
-    print(f"Pulled {pulled} files ({_human_size(total_bytes)})")
+
+    if not quiet:
+        parts = [f"Pulled {pulled} files ({_human_size(total_bytes)})"]
+        if merged:
+            parts.append(f"merged {merged} conflicts")
+        if skipped_conflicts:
+            parts.append(f"{len(skipped_conflicts)} unresolved conflicts (see .conflict files)")
+        print(", ".join(parts))
 
 
 def cmd_status(config: dict, verbose: bool = False):
@@ -653,6 +817,11 @@ def handle_hook():
 
     Called globally for all Claude Code sessions. Must NEVER crash or block —
     any unhandled exception would disrupt the user's session.
+
+    Supported events:
+    - UserPromptSubmit: auto-pull once per session (first prompt only)
+    - Stop: auto-push after Claude produces content
+    - SessionEnd: final sync before exit
     """
     try:
         raw = sys.stdin.read()
@@ -666,10 +835,10 @@ def handle_hook():
 
         event = data.get("hook_event_name", "")
 
-        if event not in ("Stop", "SessionEnd"):
+        if event not in ("UserPromptSubmit", "Stop", "SessionEnd"):
             return
 
-        # Check if config exists before attempting push
+        # Check if config exists before attempting anything
         if not CONFIG_FILE.exists():
             _log("Hook skipped: memroach_config.json not found")
             return
@@ -683,6 +852,30 @@ def handle_hook():
                 return
         except (json.JSONDecodeError, OSError) as e:
             _log(f"Hook skipped: config error: {e}")
+            return
+
+        if event == "UserPromptSubmit":
+            # Auto-pull on first prompt of a session
+            if not config.get("auto_pull_on_start", True):
+                return
+            # Use a lock file to only pull once per session
+            session_id = data.get("session_id", "")
+            if not session_id:
+                return
+            pull_marker = Path(f"/tmp/memroach_pulled_{session_id}")
+            if pull_marker.exists():
+                return  # Already pulled for this session
+            try:
+                pull_marker.touch()
+            except OSError:
+                return
+
+            _log(f"Hook triggered: auto-pull for session {session_id[:8]}")
+            # Pull in foreground (fast — only downloads changed files)
+            try:
+                cmd_pull(config, quiet=True, verbose=False)
+            except Exception as e:
+                _log(f"Auto-pull error: {e}")
             return
 
         # Check auto-push settings
@@ -754,6 +947,7 @@ def main():
     p_pull.add_argument("--force", action="store_true", help="Overwrite even if local is newer")
     p_pull.add_argument("--dry-run", action="store_true", help="Show what would be pulled")
     p_pull.add_argument("--verbose", "-v", action="store_true")
+    p_pull.add_argument("--quiet", "-q", action="store_true")
 
     # status
     p_status = sub.add_parser("status", help="Show sync status")
@@ -788,7 +982,7 @@ def main():
                 _log(f"Push error: {e}")
     elif args.command == "pull":
         cmd_pull(config, target=args.target, force=args.force,
-                 dry_run=args.dry_run, verbose=args.verbose)
+                 dry_run=args.dry_run, verbose=args.verbose, quiet=args.quiet)
     elif args.command == "status":
         cmd_status(config, verbose=args.verbose)
     elif args.command == "diff":
